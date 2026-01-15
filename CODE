@@ -1,0 +1,631 @@
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include "driver/ledc.h"
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <PubSubClient.h>
+#include <time.h>
+
+// -----------------------------
+// Function Declarations
+// -----------------------------
+void drawGUI();
+void handleTouch();
+void fadeBacklight();
+void fadeLEDs();
+void setLED(uint8_t r, uint8_t g, uint8_t b);
+void setBacklight(uint8_t level);
+void ledsAttachPWM();
+void ledsDetachHiZ();
+void ledRed();
+void ledGreen();
+void ledBlue();
+void ledWhite();
+void toggleLED();
+void goHome();
+void goTemp();
+void goLights();
+void goSettings();
+void goAbout();
+void goMore();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void mqttReconnect();
+void mqttPublish(const char* topic, const char* message);
+void addButton(int x, int y, int w, int h, uint16_t color, const char* label, void(*action)(), bool highlight);
+void drawClock();
+void drawStatus();
+
+char timeStr[6];  // HH:MM
+
+// -----------------------------
+// Hardware Setup
+// -----------------------------
+TFT_eSPI tft = TFT_eSPI();
+#define SCREEN_W 320
+#define SCREEN_H 240
+#define Y_OFFSET 0
+
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+SPIClass touchSPI = SPIClass(SPI);
+XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
+
+#define LED_R 4
+#define LED_G 16
+#define LED_B 17
+#define TFT_BL 21
+
+#define PWM_FREQ 5000
+#define PWM_RES LEDC_TIMER_8_BIT
+#define CH_R  LEDC_CHANNEL_0
+#define CH_G  LEDC_CHANNEL_1
+#define CH_B  LEDC_CHANNEL_2
+#define CH_BL LEDC_CHANNEL_3
+
+// -----------------------------
+// WiFi + MQTT
+// -----------------------------
+const char* ssid     = "-----SSID-------";
+const char* password = "-----PASSWORD------";
+
+WiFiClient espWiFiClient;
+PubSubClient mqttClient(espWiFiClient);
+bool wifiConnected = false;
+
+const char* MQTT_HOST = "----BROKER IP-----";
+const uint16_t MQTT_PORT = 1883; ///CHANGE TO WHATEVER YOUS IS USSALLY THIS FOR HA
+const char* mqtt_user   = "-------MQTT USER NAME-------";
+const char* mqtt_pass   = "------------PASSWORD------";
+const char* mqtt_topic  = "home/#";   // for terminal
+
+#define MAX_MQTT_LINES 12
+String mqttLines[MAX_MQTT_LINES];
+bool mqttConnected = false;
+
+// -----------------------------
+// MQTT device topics (6 entities)
+// -----------------------------
+enum DEVICE_INDEX {
+  DEV_MEDIA_WALL = 0,
+  DEV_EGG_LAMP   = 1,
+  DEV_LIVING     = 2,
+  DEV_BLINDS     = 3,
+  DEV_HALL       = 4,
+  DEV_UNUSED     = 5
+};
+
+String cmdTopic[6] = {
+  "homeassistant/light/media_wall/set",        // media wall
+  "homeassistant/light/egg_lamp/set",          // egg lamp
+  "homeassistant/light/living_room_lamp/set",  // living room lamp
+  "homeassistant/cover/blinds/set",            // blinds
+  "homeassistant/light/hall_light/set",        // hall light
+  ""
+};
+
+String stateTopic[6] = {
+  "homeassistant/light/media_wall/state",
+  "homeassistant/light/egg_lamp/state",
+  "homeassistant/light/living_room_lamp/state",
+  "homeassistant/cover/blinds/state",
+  "homeassistant/light/hall_light/state",
+  ""
+};
+
+bool deviceState[6] = {0, 0, 0, 0, 0, 0};
+
+// -----------------------------
+// GUI + LED State
+// -----------------------------
+#define MAX_BUTTONS 16
+struct Button {
+  int x, y, w, h;
+  uint16_t color;
+  const char* label;
+  void (*action)();
+  bool isCurrent;
+
+  void draw() {
+    tft.fillRoundRect(x, y + Y_OFFSET, w, h, 10, color);
+    tft.drawRoundRect(x, y + Y_OFFSET, w, h, 10, isCurrent ? TFT_WHITE : TFT_BLACK);
+    tft.setTextColor(TFT_BLACK, color);
+    tft.drawCentreString(label, x + w / 2, y + h / 2 + Y_OFFSET - 6, 2);
+  }
+
+  bool pressed(int px, int py) {
+    if (px >= x && px <= x + w && py >= y && py <= y + h) {
+      if (action) action();
+      return true;
+    }
+    return false;
+  }
+};
+
+Button buttons[MAX_BUTTONS];
+int buttonCount = 0;
+
+enum PAGE { HOME, TEMP, LIGHTS, SETTINGS, ABOUT, MORE };
+PAGE currentPage = HOME;
+
+bool ledsEnabled = false;
+uint8_t targetR = 255, targetG = 255, targetB = 255;
+uint8_t currentR = 255, currentG = 255, currentB = 255;
+uint8_t targetBL = 255, currentBL = 255;
+
+unsigned long lastInteraction = 0;
+unsigned long lastTouch = 0;
+bool screenSleeping = false;
+bool justWokeUp = false;
+bool touchActive = false;
+#define TOUCH_DEBOUNCE 150
+
+// -----------------------------
+// LED Control
+// -----------------------------
+void setLED(uint8_t r, uint8_t g, uint8_t b) {
+  targetR = r;
+  targetG = g;
+  targetB = b;
+}
+
+void setBacklight(uint8_t level) {
+  targetBL = constrain(level, 0, 255);
+}
+
+void fadeLEDs() {
+  if (!ledsEnabled) return;
+  if (currentR != targetR) currentR += (targetR > currentR) ? 1 : -1;
+  if (currentG != targetG) currentG += (targetG > currentG) ? 1 : -1;
+  if (currentB != targetB) currentB += (targetB > currentB) ? 1 : -1;
+
+  analogWrite(LED_R, 255 - (currentR * currentBL) / 255);
+  analogWrite(LED_G, 255 - (currentG * currentBL) / 255);
+  analogWrite(LED_B, 255 - (currentB * currentBL) / 255);
+}
+
+void fadeBacklight() {
+  if (currentBL != targetBL) {
+    currentBL += (targetBL > currentBL) ? 1 : -1;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BL, currentBL);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BL);
+  }
+}
+
+void ledsAttachPWM() {
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+}
+
+void ledsDetachHiZ() {
+  pinMode(LED_R, INPUT);
+  pinMode(LED_G, INPUT);
+  pinMode(LED_B, INPUT);
+}
+
+void ledRed()   { setLED(255, 0, 0);   currentR = targetR; currentG = targetG; currentB = targetB; drawGUI(); }
+void ledGreen() { setLED(0, 255, 0);   currentR = targetR; currentG = targetG; currentB = targetB; drawGUI(); }
+void ledBlue()  { setLED(0, 0, 255);   currentR = targetR; currentG = targetG; currentB = targetB; drawGUI(); }
+void ledWhite() { setLED(255, 255, 255); currentR = targetR; currentG = targetG; currentB = targetB; drawGUI(); }
+
+void toggleLED() {
+  ledsEnabled = !ledsEnabled;
+  if (!ledsEnabled) {
+    setLED(255, 255, 255);
+    ledsDetachHiZ();
+  } else {
+    ledsAttachPWM();
+    currentR = targetR;
+    currentG = targetG;
+    currentB = targetB;
+  }
+  drawGUI();
+}
+
+// -----------------------------
+// Page Navigation
+// -----------------------------
+void goHome()     { currentPage = HOME; drawGUI(); }
+void goTemp()     { currentPage = TEMP; drawGUI(); }
+void goLights()   { currentPage = LIGHTS; drawGUI(); }
+void goSettings() { currentPage = SETTINGS; drawGUI(); }
+void goAbout()    { currentPage = ABOUT; drawGUI(); }
+void goMore()     { currentPage = MORE; drawGUI(); }
+
+// -----------------------------
+// MQTT Button Actions
+// -----------------------------
+void actionMediaWall() {
+  bool newState = !deviceState[DEV_MEDIA_WALL];
+  deviceState[DEV_MEDIA_WALL] = newState;
+  mqttPublish(cmdTopic[DEV_MEDIA_WALL].c_str(), newState ? "ON" : "OFF");
+  drawGUI();
+}
+
+void actionEggLamp() {
+  bool newState = !deviceState[DEV_EGG_LAMP];
+  deviceState[DEV_EGG_LAMP] = newState;
+  mqttPublish(cmdTopic[DEV_EGG_LAMP].c_str(), newState ? "ON" : "OFF");
+  drawGUI();
+}
+
+void actionLivingRoom() {
+  bool newState = !deviceState[DEV_LIVING];
+  deviceState[DEV_LIVING] = newState;
+  mqttPublish(cmdTopic[DEV_LIVING].c_str(), newState ? "ON" : "OFF");
+  drawGUI();
+}
+
+void actionBlinds() {
+  bool newState = !deviceState[DEV_BLINDS];
+  deviceState[DEV_BLINDS] = newState;
+  mqttPublish(cmdTopic[DEV_BLINDS].c_str(), newState ? "OPEN" : "CLOSE");
+  drawGUI();
+}
+
+void actionHallLight() {
+  bool newState = !deviceState[DEV_HALL];
+  deviceState[DEV_HALL] = newState;
+  mqttPublish(cmdTopic[DEV_HALL].c_str(), newState ? "ON" : "OFF");
+  drawGUI();
+}
+
+// -----------------------------
+// GUI Drawing
+// -----------------------------
+void addButton(int x, int y, int w, int h, uint16_t color, const char* label, void(*action)(), bool highlight) {
+  if (buttonCount >= MAX_BUTTONS) return;
+  buttons[buttonCount++] = { x, y, w, h, color, label, action, highlight };
+}
+
+void drawClock() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char timeStr[9];  // HH:MM:SS
+  char dateStr[20]; // DD MMM YYYY
+
+  if (timeinfo && timeinfo->tm_year > 100) {
+    sprintf(timeStr, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    strftime(dateStr, sizeof(dateStr), "%d %b %Y", timeinfo);
+  } else {
+    strcpy(timeStr, "--:--:--");
+    strcpy(dateStr, "-- --- ----");
+  }
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawRightString(String(timeStr), SCREEN_W - 10, 40, 4);  // Big time
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawRightString(String(dateStr), SCREEN_W - 10, 70, 2);  // Small date
+}
+
+void drawStatus() {
+  // WiFi status
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(String("WiFi: ") + (wifiConnected ? "Connected" : "Connecting..."), 10, 40, 2);
+
+  // IP address
+  if (wifiConnected) {
+    tft.drawString("IP: " + WiFi.localIP().toString(), 10, 58, 2);
+  }
+
+  // Signal bars
+  int rssi = WiFi.RSSI();
+  int bars = 0;
+  if (rssi > -50) bars = 5;
+  else if (rssi > -60) bars = 4;
+  else if (rssi > -70) bars = 3;
+  else if (rssi > -80) bars = 2;
+  else if (rssi > -90) bars = 1;
+  else bars = 0;
+
+  int barWidth = 4;
+  int spacing = 3;
+  int totalWidth = 5 * (barWidth + spacing);
+  int baseX = SCREEN_W - totalWidth - 5;
+  int baseY = 10;
+
+  for (int i = 0; i < 5; i++) {
+    int barHeight = (i + 1) * 4;
+    int x = baseX + i * (barWidth + spacing);
+    int y = baseY + 20 - barHeight;
+    uint16_t color = (i < bars) ? TFT_GREEN : TFT_DARKGREY;
+    tft.fillRect(x, y, barWidth, barHeight, color);
+  }
+}
+
+void drawGUI() {
+  tft.fillScreen(TFT_BLACK);
+  buttonCount = 0;
+
+  switch (currentPage) {
+    case HOME: {
+      // Title
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.drawString("HamHacks Dash v4", 5, 10, 4);
+
+      // Status + Clock
+      drawStatus();
+      drawClock();
+
+      // Divider
+      tft.drawLine(0, 85, SCREEN_W, 85, TFT_DARKGREY);
+
+      // 3x2 grid, Option A layout, 140x45 buttons
+      uint16_t colOn  = TFT_GREEN;
+      uint16_t colOff = TFT_RED;
+
+      // Row 1 (y = 90)
+      addButton(10,  90, 140, 45, deviceState[DEV_MEDIA_WALL] ? colOn : colOff, "Media Wall",  actionMediaWall, false);
+      addButton(170, 90, 140, 45, deviceState[DEV_EGG_LAMP]   ? colOn : colOff, "Egg Lamp",    actionEggLamp,   false);
+
+      // Row 2 (y = 140)
+      addButton(10,  140,140, 45, deviceState[DEV_LIVING]     ? colOn : colOff, "Living Room", actionLivingRoom,false);
+      addButton(170, 140,140, 45, deviceState[DEV_BLINDS]     ? colOn : colOff, "Blinds",      actionBlinds,    false);
+
+      // Row 3 (y = 190)
+      addButton(10,  190,140, 45, deviceState[DEV_HALL] ? colOn : colOff, "Hall Light", actionHallLight, false);
+      addButton(170, 190,140, 45, TFT_BLUE, "More...",  goMore, false);
+    } break;
+
+    case TEMP:
+      addButton(5, 15, 70, 30, TFT_DARKGREY, "< BACK", goMore, false);
+      tft.drawCentreString("TEMP PAGE", SCREEN_W / 2, 90, 4);
+      break;
+
+    case LIGHTS:
+      addButton(5, 15, 70, 30, TFT_DARKGREY, "< BACK", goMore, false);
+      tft.drawCentreString("LED / LIGHTS PAGE", SCREEN_W / 2, 90, 4);
+      break;
+
+    case SETTINGS:
+      addButton(5, 15, 70, 30, TFT_DARKGREY, "< BACK", goMore, false);
+      tft.drawCentreString("SETTINGS PAGE", SCREEN_W / 2, 90, 4);
+      break;
+
+    case ABOUT: {
+      addButton(5, 15, 70, 30, TFT_DARKGREY, "< BACK", goMore, false);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawCentreString("MQTT Terminal", SCREEN_W / 2, 5, 2);
+      tft.drawRoundRect(5, 45, 310, 185, 5, TFT_DARKGREY);
+
+      int y = 50;
+      for (int i = 0; i < MAX_MQTT_LINES; i++) {
+        if (mqttLines[i].length() > 0) {
+          String line = mqttLines[i];
+          if (line.length() > 45) line = line.substring(0, 45) + "...";
+          tft.drawString(line, 10, y, 2);
+          y += 15;
+        }
+      }
+    } break;
+
+    case MORE: {
+      addButton(5, 15, 70, 30, TFT_DARKGREY, "< HOME", goHome, false);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawCentreString("More", SCREEN_W / 2, 5, 2);
+
+      addButton(10,  50, 140, 55, TFT_BLUE,   "TEMP",       goTemp,     false);
+      addButton(170, 50, 140, 55, TFT_GREEN,  "LED/LIGHTS", goLights,   false);
+      addButton(10,  120,140, 55, TFT_RED,    "SETTINGS",   goSettings, false);
+      addButton(170, 120,140, 55, TFT_PURPLE, "MQTT TERM",  goAbout,    false);
+    } break;
+  }
+
+  for (int i = 0; i < buttonCount; i++) buttons[i].draw();
+}
+
+// -----------------------------
+// Touch Handling (cleaned)
+// -----------------------------
+void handleTouch() {
+  if (!touch.tirqTouched() || !touch.touched()) {
+    touchActive = false;
+    return;
+  }
+
+TS_Point p = touch.getPoint();
+
+// Improved calibration (recommended)
+int x = map(p.x, 300, 3800, 0, SCREEN_W);
+int y = map(p.y, 200, 3900, 0, SCREEN_H);
+
+// ⭐ Add smoothing filter here
+static int lastX = 0, lastY = 0;
+x = (x + lastX) / 2;
+y = (y + lastY) / 2;
+lastX = x;
+lastY = y;
+
+unsigned long now = millis();
+
+  if (screenSleeping && currentBL == 0) {
+    screenSleeping = false;
+    justWokeUp = true;
+    setBacklight(255);
+    lastInteraction = now;
+    drawGUI();
+    while (touch.touched()) delay(5);
+    return;
+  }
+
+  if (justWokeUp) {
+    justWokeUp = false;
+    lastInteraction = now;
+    return;
+  }
+
+  if (!touchActive && (now - lastTouch) > TOUCH_DEBOUNCE) {
+    touchActive = true;
+    lastTouch = now;
+
+    // OLD LIGHTS HITBOXES REMOVED
+
+    for (int i = 0; i < buttonCount; i++) {
+      if (buttons[i].pressed(x, y)) {
+        lastInteraction = now;
+        return;
+      }
+    }
+  }
+}
+
+// -----------------------------
+// MQTT Handling
+// -----------------------------
+
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+  // Timestamp for terminal
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char tStr[6];
+
+  if (timeinfo && timeinfo->tm_year > 100) {
+    sprintf(tStr, "%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min);
+  } else {
+    strcpy(tStr, "--:--");
+  }
+
+  String line = String(tStr) + " | " + String(topic) + ": " + msg;
+  for (int i = MAX_MQTT_LINES - 1; i > 0; i--) mqttLines[i] = mqttLines[i - 1];
+  mqttLines[0] = line;
+
+  // Update device states
+  for (int i = 0; i < 6; i++) {
+    if (stateTopic[i].length() && String(topic) == stateTopic[i]) {
+      if (i == DEV_BLINDS) {
+        deviceState[i] = (msg == "OPEN");
+      } else {
+        deviceState[i] = (msg == "ON");
+      }
+    }
+  }
+
+  // ⭐ Only redraw terminal page, never HOME
+  if (currentPage == ABOUT) drawGUI();
+}
+
+void mqttReconnect() {
+  if (mqttClient.connect("ESP32Client", mqtt_user, mqtt_pass)) {
+    mqttClient.subscribe(mqtt_topic);
+    for (int i = 0; i < 6; i++) {
+      if (stateTopic[i].length())
+        mqttClient.subscribe(stateTopic[i].c_str());
+    }
+    mqttConnected = true;
+  } else {
+    mqttConnected = false;
+  }
+}
+
+void mqttPublish(const char* topic, const char* message) {
+  mqttClient.publish(topic, message);
+}
+
+// -----------------------------
+// Setup
+// -----------------------------
+void setup() {
+  Serial.begin(115200);
+  configTime(0, 0, "pool.ntp.org");
+
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  ledc_timer_config_t timer_conf = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .duty_resolution = PWM_RES,
+    .timer_num = LEDC_TIMER_0,
+    .freq_hz = PWM_FREQ,
+    .clk_cfg = LEDC_AUTO_CLK
+  };
+  ledc_timer_config(&timer_conf);
+
+  ledc_channel_config_t ch = {
+    .gpio_num = TFT_BL,
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .channel = CH_BL,
+    .intr_type = LEDC_INTR_DISABLE,
+    .timer_sel = LEDC_TIMER_0,
+    .duty = 255,
+    .hpoint = 0
+  };
+  ledc_channel_config(&ch);
+  currentBL = targetBL = 255;
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BL, 255);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BL);
+
+  touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  touch.begin(touchSPI);
+  touch.setRotation(1);
+
+  ledsDetachHiZ();
+  ledsEnabled = false;
+  currentR = currentG = currentB = 255;
+  targetR = targetG = targetB = 255;
+
+  WiFi.begin(ssid, password);
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  drawGUI();
+  lastInteraction = millis();
+}
+
+unsigned long lastClockUpdate = 0;
+unsigned long lastStatusUpdate = 0;
+
+// -----------------------------
+// Main Loop
+// -----------------------------
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) mqttReconnect();
+    mqttClient.loop();
+  }
+
+  handleTouch();
+  fadeLEDs();
+  fadeBacklight();
+
+  if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+    wifiConnected = true;
+    drawGUI();
+  }
+
+  unsigned long idle = millis() - lastInteraction;
+
+  if (!screenSleeping && currentPage != HOME && idle > 10000) {
+    currentPage = HOME;
+    drawGUI();
+  }
+
+  if (!screenSleeping && idle > 20000) {
+    setBacklight(0);
+    screenSleeping = true;
+  }
+
+  // Live clock (only on HOME page)
+  if (millis() - lastClockUpdate > 1000) {
+    if (currentPage == HOME) {
+      drawClock();
+    }
+    lastClockUpdate = millis();
+  }
+
+  // Live signal + WiFi status (only on HOME page)
+  if (millis() - lastStatusUpdate > 5000) {
+    if (currentPage == HOME) {
+      drawStatus();
+    }
+    lastStatusUpdate = millis();
+  }
+}
